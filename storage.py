@@ -179,7 +179,6 @@ def save_state(state):
     )
     temporary.replace(STATE_FILE)
 
-
 def sticker_layout(sticker):
     keys = (
         "id",
@@ -187,8 +186,18 @@ def sticker_layout(sticker):
         "note_title",
         "visible",
         *STYLE_KEYS,
+        "sort_mode",
+        "done_last",
     )
+
+    defaults = {
+        "sort_mode": "deadline_asc",
+        "done_last": True,
+    }
+
     return {
-        key: deepcopy(sticker[key])
+        key: deepcopy(
+            sticker.get(key, defaults.get(key))
+        )
         for key in keys
     }

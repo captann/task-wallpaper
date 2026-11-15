@@ -1,5 +1,5 @@
 from datetime import datetime
-
+from task_order import sorted_tasks
 from PySide6.QtCore import QRect, Qt
 from PySide6.QtGui import (
     QColor,
@@ -129,17 +129,9 @@ def draw_sticker(painter, sticker, width, height):
         painter.setFont(font)
         painter.setPen(normal)
 
-        active = [
-            task
-            for task in sticker["tasks"]
-            if not task.get("done")
-        ]
-        active.sort(
-            key=lambda task: (
-                not bool(task.get("deadline")),
-                task.get("deadline") or "",
-                task.get("created", ""),
-            )
+        active = sorted_tasks(
+            sticker,
+            include_done=False,
         )
 
         # Без заголовков и без дедлайнов используем всю ширину.
@@ -298,13 +290,43 @@ def draw_sticker(painter, sticker, width, height):
         painter.restore()
 
 
-def render_wallpaper(background_path, stickers, width, height):
+def render_wallpaper(
+    background_path,
+    stickers,
+    width,
+    height,
+    output_size=None,
+    background_image=None,
+):
+    # width/height — логическое разрешение рабочего стола.
+    # output_size — реальное разрешение создаваемого изображения.
+    if output_size is None:
+        output_width, output_height = width, height
+    else:
+        output_width, output_height = output_size
+
+    output_width = max(1, int(output_width))
+    output_height = max(1, int(output_height))
+
     image = QImage(
-        width, height, QImage.Format.Format_RGB32
+        output_width,
+        output_height,
+        QImage.Format.Format_RGB32,
     )
+
+    if image.isNull():
+        raise MemoryError(
+            "Не удалось выделить память для изображения."
+        )
+
     image.fill(QColor("#263343"))
 
     painter = QPainter(image)
+
+    if not painter.isActive():
+        raise RuntimeError(
+            "Не удалось начать отрисовку изображения."
+        )
 
     try:
         painter.setRenderHint(
@@ -317,27 +339,51 @@ def render_wallpaper(background_path, stickers, width, height):
             QPainter.RenderHint.SmoothPixmapTransform
         )
 
-        if background_path:
+        # Сохраняем одинаковую геометрию и размеры текста
+        # в превью и полноразмерных обоях.
+        painter.scale(
+            output_width / width,
+            output_height / height,
+        )
+
+        if (
+            background_image is not None
+            and not background_image.isNull()
+        ):
+            painter.drawImage(
+                QRect(0, 0, width, height),
+                background_image,
+            )
+
+        elif background_path:
             background = QImage(background_path)
 
-            if not background.isNull():
-                background = background.scaled(
-                    width,
-                    height,
-                    Qt.AspectRatioMode.KeepAspectRatioByExpanding,
-                    Qt.TransformationMode.SmoothTransformation,
+            if background.isNull():
+                raise OSError(
+                    f"Не удалось открыть фон:\n"
+                    f"{background_path}"
                 )
 
-                painter.drawImage(
-                    (width - background.width()) // 2,
-                    (height - background.height()) // 2,
-                    background,
-                )
+            background = background.scaled(
+                width,
+                height,
+                Qt.AspectRatioMode.KeepAspectRatioByExpanding,
+                Qt.TransformationMode.SmoothTransformation,
+            )
+
+            painter.drawImage(
+                (width - background.width()) // 2,
+                (height - background.height()) // 2,
+                background,
+            )
 
         for sticker in stickers:
             if sticker.get("visible", True):
                 draw_sticker(
-                    painter, sticker, width, height
+                    painter,
+                    sticker,
+                    width,
+                    height,
                 )
 
     finally:

@@ -1,4 +1,15 @@
 import json
+from PySide6.QtCore import QSize
+
+from render_service import (
+    RenderService,
+    remove_temporary_files,
+)
+from task_order import (
+    SORT_OPTIONS,
+    parse_local_datetime,
+    sorted_tasks,
+)
 from PySide6.QtGui import QPalette
 import shutil
 import sys
@@ -54,7 +65,7 @@ from PySide6.QtWidgets import (
 )
 
 from preview import WallpaperPreview
-from renderer import is_overdue, render_wallpaper
+from renderer import is_overdue
 from storage import (
     BACKGROUNDS,
     DATA,
@@ -167,10 +178,36 @@ class MainWindow(QMainWindow):
         super().__init__()
 
         self.state = load_state()
+        self.state.setdefault("notifications_enabled", True)
+        self.state.setdefault("reminder_minutes", 30)
+        self.state.setdefault("notify_at_deadline", True)
         self.image = None
         self.tray = None
         self.last_signature = None
         self.syncing = False
+        self._closing = False
+        self._apply_requested = False
+        self._apply_silent = True
+        self._export_paths = []
+
+        self.render_service = RenderService(self)
+        self.render_service.ready.connect(
+            self.render_finished
+        )
+        self.render_service.stopped.connect(
+            self.render_thread_stopped
+        )
+
+        self.render_notice_timer = QTimer(self)
+        self.render_notice_timer.setSingleShot(True)
+        self.render_notice_timer.timeout.connect(
+            self.show_render_notice
+        )
+
+        self.render_status = QLabel("")
+        self.statusBar().addWidget(
+            self.render_status
+        )
 
         self.geometry_save_timer = QTimer(self)
         self.geometry_save_timer.setSingleShot(True)
@@ -184,7 +221,14 @@ class MainWindow(QMainWindow):
         self.resize(1350, 850)
 
         self.build_ui()
+
+
+        QApplication.instance().aboutToQuit.connect(
+            self.render_service.shutdown_blocking
+        )
+
         self.build_tray()
+
         self.populate_backgrounds()
         self.populate_presets()
         self.rebuild_tabs()
@@ -195,6 +239,249 @@ class MainWindow(QMainWindow):
         self.timer = QTimer(self)
         self.timer.timeout.connect(self.check_deadlines)
         self.timer.start(15_000)
+        QTimer.singleShot(
+            1500,
+            self.check_deadlines,
+        )
+
+    def queue_render(self, delay_ms=80):
+        if self._closing:
+            return
+
+        screen = QApplication.primaryScreen()
+        size = screen.size()
+        ratio = screen.devicePixelRatio()
+
+        width = max(1, round(size.width() * ratio))
+        height = max(1, round(size.height() * ratio))
+
+        # Превью ограничено по размеру, даже если монитор 4K.
+        preview_limit = QSize(
+            max(
+                320,
+                min(
+                    1600,
+                    round(self.preview.width() * ratio),
+                ),
+            ),
+            max(
+                240,
+                min(
+                    1000,
+                    round(self.preview.height() * ratio),
+                ),
+            ),
+        )
+
+        preview_size = QSize(
+            width,
+            height,
+        ).scaled(
+            preview_limit,
+            Qt.AspectRatioMode.KeepAspectRatio,
+        )
+
+        # Не увеличиваем маленькое исходное разрешение.
+        preview_width = min(
+            width, preview_size.width()
+        )
+        preview_height = min(
+            height, preview_size.height()
+        )
+
+        # Передаём отдельный снимок данных.
+        # Не копируем служебную историю уведомлений.
+        stickers = []
+
+        for source in self.state["stickers"]:
+            sticker = {
+                key: deepcopy(value)
+                for key, value in source.items()
+                if key != "tasks"
+            }
+
+            sticker["tasks"] = [
+                {
+                    "title": task.get("title", ""),
+                    "deadline": task.get("deadline"),
+                    "done": task.get("done", False),
+                    "created": task.get("created", ""),
+                }
+                for task in source["tasks"]
+            ]
+
+            stickers.append(sticker)
+
+        background = self.state["active_background"]
+
+        job = {
+            "background": (
+                str(DATA / background)
+                if background
+                else ""
+            ),
+            "stickers": stickers,
+            "screen_size": (width, height),
+            "preview_size": (
+                preview_width,
+                preview_height,
+            ),
+            "apply_wallpaper": self._apply_requested,
+            "export_paths": list(self._export_paths),
+            "data_dir": str(DATA),
+        }
+
+        self.render_service.submit(
+            job,
+            delay_ms=delay_ms,
+        )
+
+        if (
+            not self.render_notice_timer.isActive()
+            and not self.render_status.text()
+        ):
+            self.render_notice_timer.start(1000)
+
+    def show_render_notice(self):
+        if (
+            not self._closing
+            and self.render_service.has_work()
+        ):
+            self.render_status.setText(
+                "Обновление изображения…"
+            )
+
+    def render_finished(self, result):
+        if self._closing:
+            remove_temporary_files(result)
+            return
+
+        self.render_notice_timer.stop()
+        self.render_status.clear()
+
+        apply_requested = self._apply_requested
+        apply_silent = self._apply_silent
+        had_exports = bool(self._export_paths)
+
+        self._apply_requested = False
+        self._apply_silent = True
+        self._export_paths = []
+
+        if result.get("cancelled"):
+            remove_temporary_files(result)
+            return
+
+        if result.get("error"):
+            remove_temporary_files(result)
+
+            message = result["error"]
+
+            if had_exports or (
+                apply_requested and not apply_silent
+            ):
+                QMessageBox.warning(
+                    self,
+                    "Ошибка формирования изображения",
+                    message,
+                )
+            else:
+                self.statusBar().showMessage(
+                    message,
+                    15000,
+                )
+            return
+
+        image = result.get("image")
+
+        if image is not None and not image.isNull():
+            self.image = image
+            self.update_preview()
+
+        errors = []
+        exported_count = 0
+        wallpaper_applied = False
+
+        try:
+            temporary = result.get(
+                "wallpaper_temp"
+            )
+
+            if temporary:
+                slot = 1 - int(
+                    self.state.get(
+                        "wallpaper_slot", 0
+                    )
+                )
+
+                destination = (
+                    DATA / f"wallpaper_{slot}.bmp"
+                )
+
+                try:
+                    Path(temporary).replace(
+                        destination
+                    )
+
+                    # Применяем только принятый актуальный результат.
+                    set_wallpaper(destination)
+
+                    self.state["wallpaper_slot"] = slot
+                    wallpaper_applied = True
+
+                except Exception as error:
+                    errors.append(
+                        f"Не удалось применить обои:\n{error}"
+                    )
+
+            for item in result.get("exports", []):
+                try:
+                    Path(item["temporary"]).replace(
+                        Path(item["destination"])
+                    )
+                    exported_count += 1
+
+                except OSError as error:
+                    errors.append(
+                        "Не удалось завершить экспорт:\n"
+                        f"{item['destination']}\n{error}"
+                    )
+
+        finally:
+            remove_temporary_files(result)
+
+        if wallpaper_applied:
+            self.save_state()
+
+        if errors:
+            message = "\n\n".join(errors)
+
+            if had_exports or not apply_silent:
+                QMessageBox.warning(
+                    self,
+                    "Ошибка",
+                    message,
+                )
+            else:
+                self.statusBar().showMessage(
+                    message,
+                    15000,
+                )
+
+        elif exported_count:
+            self.statusBar().showMessage(
+                f"Изображений сохранено: {exported_count}",
+                5000,
+            )
+
+        elif wallpaper_applied:
+            self.statusBar().showMessage(
+                "Обои обновлены",
+                5000,
+            )
+
+    def render_thread_stopped(self):
+        if self._closing:
+            QApplication.instance().quit()
 
     def active_sticker(self):
         return next(
@@ -227,6 +514,218 @@ class MainWindow(QMainWindow):
         )
         layout.addWidget(button)
         return button
+
+    def sort_settings_changed(self, *_):
+        if self.syncing:
+            return
+
+        sticker = self.active_sticker()
+
+        sticker["sort_mode"] = (
+            self.sort_combo.currentData()
+            or "deadline_asc"
+        )
+        sticker["done_last"] = (
+            self.done_last_check.isChecked()
+        )
+
+        self.changed()
+
+    def notification_settings_changed(self, *_):
+        enabled = self.notifications_check.isChecked()
+
+        self.state["notifications_enabled"] = enabled
+        self.state["reminder_minutes"] = (
+            self.reminder_minutes_spin.value()
+        )
+        self.state["notify_at_deadline"] = (
+            self.notify_at_deadline_check.isChecked()
+        )
+
+        self.reminder_minutes_spin.setEnabled(enabled)
+        self.notify_at_deadline_check.setEnabled(enabled)
+
+        self.save_state()
+
+    def notifications_available(self):
+        return (
+            self.tray is not None
+            and self.tray.isVisible()
+            and QSystemTrayIcon.supportsMessages()
+        )
+
+    def test_notification(self):
+        if not self.notifications_available():
+            QMessageBox.information(
+                self,
+                "Уведомления недоступны",
+                "Не удалось использовать уведомления трея. "
+                "Проверьте наличие значка приложения "
+                "в области уведомлений.",
+            )
+            return
+
+        self.tray.showMessage(
+            "Task Wallpaper",
+            "Тестовое уведомление.\n"
+            "Так будут выглядеть напоминания о дедлайнах.",
+            QSystemTrayIcon.MessageIcon.Information,
+            10000,
+        )
+
+    def check_reminders(self):
+        if not self.state.get(
+            "notifications_enabled", True
+        ):
+            return
+
+        if not self.notifications_available():
+            return
+
+        now = datetime.now()
+        minutes = int(
+            self.state.get("reminder_minutes", 30)
+        )
+        notify_at_deadline = self.state.get(
+            "notify_at_deadline", True
+        )
+
+        pending = []
+
+        for sticker in self.state["stickers"]:
+            for task in sticker["tasks"]:
+                if task.get("done"):
+                    continue
+
+                raw_deadline = task.get("deadline")
+                deadline = parse_local_datetime(
+                    raw_deadline
+                )
+
+                if deadline is None:
+                    continue
+
+                seconds_left = (
+                    deadline - now
+                ).total_seconds()
+
+                # Изменение срока, интервала или ID
+                # создаёт новый цикл напоминаний.
+                notification_key = (
+                    f"{sticker['id']}|"
+                    f"{task['id']}|"
+                    f"{raw_deadline}|"
+                    f"{minutes}"
+                )
+
+                previous = task.get(
+                    "_notification_state", {}
+                )
+
+                if (
+                    not isinstance(previous, dict)
+                    or previous.get("key")
+                    != notification_key
+                ):
+                    previous = {
+                        "key": notification_key
+                    }
+
+                phase = None
+                phase_label = None
+
+                if (
+                    0 < seconds_left <= minutes * 60
+                    and not previous.get("before")
+                ):
+                    phase = "before"
+                    phase_label = "Скоро дедлайн"
+
+                elif (
+                    notify_at_deadline
+                    and -600 <= seconds_left <= 0
+                    and not previous.get("due")
+                ):
+                    phase = "due"
+                    phase_label = "Дедлайн наступил"
+
+                if phase is None:
+                    continue
+
+                pending.append(
+                    {
+                        "task": task,
+                        "state": dict(previous),
+                        "phase": phase,
+                        "label": phase_label,
+                        "sticker_name": sticker["name"],
+                        "deadline": deadline,
+                    }
+                )
+
+        if not pending:
+            return
+
+        # Одно сводное уведомление вместо серии,
+        # которая могла бы перекрывать сама себя.
+        pending.sort(
+            key=lambda item: (
+                item["phase"] != "due",
+                item["deadline"],
+            )
+        )
+
+        lines = []
+
+        for item in pending[:5]:
+            title = (
+                item["task"]["title"]
+                .replace("\n", " ")
+                .strip()
+            )
+
+            if len(title) > 90:
+                title = title[:87] + "..."
+
+            lines.append(
+                f"{item['label']} — "
+                f"{item['sticker_name']}: {title}\n"
+                f"Срок: "
+                f"{item['deadline']:%d.%m.%Y %H:%M}"
+            )
+
+        if len(pending) > 5:
+            lines.append(
+                f"Ещё задач: {len(pending) - 5}. "
+                "Откройте приложение."
+            )
+
+        has_due = any(
+            item["phase"] == "due"
+            for item in pending
+        )
+
+        icon = (
+            QSystemTrayIcon.MessageIcon.Warning
+            if has_due
+            else QSystemTrayIcon.MessageIcon.Information
+        )
+
+        self.tray.showMessage(
+            "Task Wallpaper — дедлайны",
+            "\n\n".join(lines),
+            icon,
+            10000,
+        )
+
+        # Запоминаем отправку, чтобы не повторять
+        # одно сообщение каждые 15 секунд.
+        for item in pending:
+            record = item["state"]
+            record[item["phase"]] = True
+            item["task"]["_notification_state"] = record
+
+        self.save_state()
 
     def build_ui(self):
         central = QWidget()
@@ -323,7 +822,31 @@ class MainWindow(QMainWindow):
         left_layout.addWidget(
             QLabel("Задачи выбранного стикера")
         )
+        sort_form = QFormLayout()
 
+        self.sort_combo = QComboBox()
+
+        for label, value in SORT_OPTIONS:
+            self.sort_combo.addItem(label, value)
+
+        self.done_last_check = QCheckBox(
+            "Выполненные задачи внизу"
+        )
+
+        sort_form.addRow(
+            "Сортировка:",
+            self.sort_combo,
+        )
+        sort_form.addRow(self.done_last_check)
+
+        left_layout.addLayout(sort_form)
+
+        self.sort_combo.currentIndexChanged.connect(
+            self.sort_settings_changed
+        )
+        self.done_last_check.toggled.connect(
+            self.sort_settings_changed
+        )
         self.table = QTableWidget(0, 3)
         self.table.setHorizontalHeaderLabels(
             ["Готово", "Задача", "Дедлайн"]
@@ -444,6 +967,68 @@ class MainWindow(QMainWindow):
             "Автоматически обновлять обои"
         )
         left_layout.addWidget(self.auto_apply)
+        left_layout.addWidget(
+            QLabel("Уведомления для всех списков")
+        )
+
+        self.notifications_check = QCheckBox(
+            "Уведомлять о дедлайнах"
+        )
+        self.notifications_check.setChecked(
+            self.state["notifications_enabled"]
+        )
+        left_layout.addWidget(self.notifications_check)
+
+        reminder_form = QFormLayout()
+
+        self.reminder_minutes_spin = QSpinBox()
+        self.reminder_minutes_spin.setRange(1, 10080)
+        self.reminder_minutes_spin.setSuffix(" мин.")
+        self.reminder_minutes_spin.setValue(
+            self.state["reminder_minutes"]
+        )
+
+        reminder_form.addRow(
+            "Напомнить за:",
+            self.reminder_minutes_spin,
+        )
+        left_layout.addLayout(reminder_form)
+
+        self.notify_at_deadline_check = QCheckBox(
+            "Уведомлять при наступлении дедлайна"
+        )
+        self.notify_at_deadline_check.setChecked(
+            self.state["notify_at_deadline"]
+        )
+        left_layout.addWidget(
+            self.notify_at_deadline_check
+        )
+
+        self.add_button(
+            left_layout,
+            "Проверить уведомления",
+            self.test_notification,
+        )
+
+        self.notifications_check.toggled.connect(
+            self.notification_settings_changed
+        )
+        self.reminder_minutes_spin.valueChanged.connect(
+            self.notification_settings_changed
+        )
+        self.notify_at_deadline_check.toggled.connect(
+            self.notification_settings_changed
+        )
+
+        notifications_enabled = (
+            self.notifications_check.isChecked()
+        )
+        self.reminder_minutes_spin.setEnabled(
+            notifications_enabled
+        )
+        self.notify_at_deadline_check.setEnabled(
+            notifications_enabled
+        )
 
         left_layout.addWidget(
             QLabel("Шаблоны общего оформления")
@@ -840,6 +1425,16 @@ class MainWindow(QMainWindow):
 
         try:
             sticker = self.active_sticker()
+            sort_index = self.sort_combo.findData(
+                sticker.get("sort_mode", "deadline_asc")
+            )
+
+            self.sort_combo.setCurrentIndex(
+                max(0, sort_index)
+            )
+            self.done_last_check.setChecked(
+                sticker.get("done_last", True)
+            )
 
             self.note_title.setText(
                 sticker["note_title"]
@@ -964,6 +1559,9 @@ class MainWindow(QMainWindow):
         self.changed()
 
     def preview_geometry_changed(self, sticker_id, rect):
+        if self._closing:
+            return
+
         sticker = self.find_sticker(sticker_id)
 
         if sticker is None:
@@ -971,7 +1569,10 @@ class MainWindow(QMainWindow):
 
         sticker["note_rect"] = list(rect)
 
-        if sticker_id == self.state["active_sticker_id"]:
+        if (
+            sticker_id
+            == self.state["active_sticker_id"]
+        ):
             width_blocker = QSignalBlocker(
                 self.note_width
             )
@@ -989,14 +1590,26 @@ class MainWindow(QMainWindow):
             del width_blocker
             del height_blocker
 
-        self.regenerate()
+        # Сразу перемещаем рамку выбора.
+        self.update_preview()
+
+        # Во время движения запрашиваем лёгкое превью.
+        # Более старые ожидающие запросы заменяются.
+        self.queue_render(delay_ms=35)
+
+        # Полноразмерный результат — после паузы.
         self.geometry_save_timer.start(350)
 
     def finish_geometry_change(self):
+        if self._closing:
+            return
+
         self.save_state()
 
         if self.state["auto_apply"]:
-            self.apply_wallpaper(silent=True)
+            self._apply_requested = True
+
+        self.queue_render(delay_ms=0)
 
     def selected_task(self):
         row = self.table.currentRow()
@@ -1099,7 +1712,10 @@ class MainWindow(QMainWindow):
                 Qt.ItemDataRole.UserRole
             )
 
-        tasks = self.active_sticker()["tasks"]
+        tasks = sorted_tasks(
+            self.active_sticker(),
+            include_done=True,
+        )
         self.table.setRowCount(len(tasks))
 
         for row, task in enumerate(tasks):
@@ -1250,13 +1866,22 @@ class MainWindow(QMainWindow):
         self.changed()
 
     def changed(self):
+        if self._closing:
+            return
+
         self.geometry_save_timer.stop()
+
         self.save_state()
         self.refresh_tasks()
-        self.regenerate()
+
+        self.last_signature = (
+            self.deadline_signature()
+        )
 
         if self.state["auto_apply"]:
-            self.apply_wallpaper(silent=True)
+            self._apply_requested = True
+
+        self.queue_render(delay_ms=100)
 
     def deadline_signature(self):
         now = datetime.now()
@@ -1272,38 +1897,36 @@ class MainWindow(QMainWindow):
         )
 
     def check_deadlines(self):
-        if (
-            self.deadline_signature()
-            == self.last_signature
-        ):
+        if self._closing:
             return
 
+        # Напоминания не ждут окончания отрисовки.
+        self.check_reminders()
+
+        signature = self.deadline_signature()
+
+        if signature == self.last_signature:
+            return
+
+        self.last_signature = signature
         self.refresh_tasks()
-        self.regenerate()
 
         if self.state["auto_apply"]:
-            self.apply_wallpaper(silent=True)
+            self._apply_requested = True
+
+        self.queue_render(delay_ms=0)
 
     def regenerate(self):
-        screen = QApplication.primaryScreen()
-        size = screen.size()
-        ratio = screen.devicePixelRatio()
+        if self._closing:
+            return
 
-        background = self.state["active_background"]
-
-        self.image = render_wallpaper(
-            background_path=(
-                str(DATA / background)
-                if background
-                else ""
-            ),
-            stickers=self.state["stickers"],
-            width=round(size.width() * ratio),
-            height=round(size.height() * ratio),
+        # Это статус данных, для которых уже запрошена
+        # отрисовка, а не статус последней готовой картинки.
+        self.last_signature = (
+            self.deadline_signature()
         )
 
-        self.last_signature = self.deadline_signature()
-        self.update_preview()
+        self.queue_render()
 
     def update_preview(self):
         if self.image is not None:
@@ -1314,44 +1937,24 @@ class MainWindow(QMainWindow):
             )
 
     def refresh_wallpaper_now(self):
-        self.regenerate()
-        self.apply_wallpaper()
+        self.apply_wallpaper(silent=False)
 
     def apply_wallpaper(self, silent=False):
-        if self.image is None:
+        if self._closing:
             return
 
-        slot = 1 - int(
-            self.state.get("wallpaper_slot", 0)
+        self._apply_requested = True
+
+        # Если есть хотя бы одно явное нажатие кнопки,
+        # ошибку нужно показать пользователю.
+        self._apply_silent = (
+            self._apply_silent and silent
         )
-        path = DATA / f"wallpaper_{slot}.bmp"
 
-        try:
-            if not self.image.save(str(path), "BMP"):
-                raise OSError(
-                    "Не удалось сохранить изображение."
-                )
-
-            set_wallpaper(path)
-            self.state["wallpaper_slot"] = slot
-            self.save_state()
-            self.statusBar().showMessage(
-                "Обои обновлены", 5000
-            )
-
-        except Exception as error:
-            if silent:
-                self.statusBar().showMessage(
-                    f"Ошибка обновления: {error}",
-                    15000,
-                )
-            else:
-                QMessageBox.warning(
-                    self, "Ошибка", str(error)
-                )
+        self.queue_render(delay_ms=0)
 
     def export_image(self):
-        if self.image is None:
+        if self._closing:
             return
 
         path, _ = QFileDialog.getSaveFileName(
@@ -1367,12 +1970,17 @@ class MainWindow(QMainWindow):
         if not Path(path).suffix:
             path += ".png"
 
-        if not self.image.save(path, "PNG"):
-            QMessageBox.warning(
-                self,
-                "Ошибка",
-                "Не удалось сохранить изображение.",
-            )
+        path = str(Path(path).resolve())
+
+        if path not in self._export_paths:
+            self._export_paths.append(path)
+
+        self.queue_render(delay_ms=0)
+
+        self.statusBar().showMessage(
+            "Экспорт изображения запрошен…",
+            3000,
+        )
 
     def populate_presets(self):
         self.preset_combo.clear()
@@ -1598,6 +2206,9 @@ class MainWindow(QMainWindow):
         self.tray.activated.connect(
             self.tray_activated
         )
+        self.tray.messageClicked.connect(
+            self.show_window
+        )
         self.tray.show()
 
     def tray_activated(self, reason):
@@ -1613,22 +2224,41 @@ class MainWindow(QMainWindow):
         self.activateWindow()
 
     def quit_application(self):
+        if self._closing:
+            return
+
+        self._closing = True
+
+        self.timer.stop()
         self.geometry_save_timer.stop()
+        self.render_notice_timer.stop()
+
         self.save_state()
+
+        self.setEnabled(False)
+        self.render_status.setText(
+            "Завершение фоновой операции…"
+        )
 
         if self.tray is not None:
             self.tray.hide()
 
-        QApplication.instance().quit()
+        # Выход произойдёт после сигнала stopped.
+        self.render_service.stop()
 
     def closeEvent(self, event):
+        if self._closing:
+            event.ignore()
+            return
+
         self.save_state()
 
         if self.tray is not None:
             self.hide()
             event.ignore()
         else:
-            event.accept()
+            event.ignore()
+            self.quit_application()
 
 
 def main():
@@ -1679,9 +2309,8 @@ def main():
         )
         return 1
 
-    app.setQuitOnLastWindowClosed(
-        window.tray is None
-    )
+    # Завершаем приложение явно после остановки потока.
+    app.setQuitOnLastWindowClosed(False)
 
     start_in_tray = "--tray" in sys.argv
 
