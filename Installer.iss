@@ -1,5 +1,5 @@
 #define MyAppName "Task Wallpaper"
-#define MyAppVersion "2.2.1"
+#define MyAppVersion "2.2.2"
 #define MyAppExeName "TaskWallpaper.exe"
 #define MyBuildDir "dist\TaskWallpaper"
 
