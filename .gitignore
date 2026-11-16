@@ -2,6 +2,7 @@
 __pycache__/
 *.py[cod]
 *$py.class
+*.pyc
 
 # Virtual environments
 .venv/
@@ -17,6 +18,7 @@ ENV/
 # Build output
 /build/
 /dist/
+/helper_dist/
 /installer_output/
 /release/
 /releases/
@@ -69,3 +71,6 @@ Thumbs.db
 ehthumbs.db
 Desktop.ini
 .DS_Store
+*.spec
+/TaskWallpaperUpdater.exe
+/updates/

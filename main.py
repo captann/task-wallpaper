@@ -1,6 +1,8 @@
 import json
+from app_version import APP_NAME
+from updater import UpdateManager
 from PySide6.QtCore import QSize
-
+from single_instance import SingleInstance
 from render_service import (
     RenderService,
     remove_temporary_files,
@@ -216,9 +218,10 @@ class MainWindow(QMainWindow):
         )
 
         self.setWindowTitle(
-            "Task Wallpaper"
+            APP_NAME
         )
         self.resize(1350, 850)
+        self.update_manager = UpdateManager(self)
 
         self.build_ui()
 
@@ -243,6 +246,11 @@ class MainWindow(QMainWindow):
             1500,
             self.check_deadlines,
         )
+        QApplication.instance().aboutToQuit.connect(
+            self.update_manager.shutdown
+        )
+
+        self.update_manager.start()
 
     def queue_render(self, delay_ms=80):
         if self._closing:
@@ -481,7 +489,7 @@ class MainWindow(QMainWindow):
 
     def render_thread_stopped(self):
         if self._closing:
-            QApplication.instance().quit()
+            self.check_shutdown_complete()
 
     def active_sticker(self):
         return next(
@@ -1048,6 +1056,9 @@ class MainWindow(QMainWindow):
         )
         left_layout.addLayout(row)
         left_layout.addStretch()
+        left_layout.addWidget(
+            self.update_manager.create_panel()
+        )
 
         right = QWidget()
         right_layout = QVBoxLayout(right)
@@ -2219,12 +2230,61 @@ class MainWindow(QMainWindow):
             self.show_window()
 
     def show_window(self):
-        self.showNormal()
+        if getattr(self, "_closing", False):
+            return
+
+        # Не сбрасываем развёрнутое окно в обычный размер.
+        if self.isMinimized():
+            self.showNormal()
+        else:
+            self.show()
+
         self.raise_()
         self.activateWindow()
 
+    def check_shutdown_complete(self):
+        if not self._closing:
+            return
+
+        thread = self.render_service.thread
+
+        if thread.isRunning():
+            # Повторный запрос безопасен.
+            # Текущую обработку изображения не обрываем.
+            thread.requestInterruption()
+            thread.quit()
+            return
+
+        poll_timer = getattr(
+            self,
+            "shutdown_poll_timer",
+            None,
+        )
+
+        if poll_timer is not None:
+            poll_timer.stop()
+
+        if self.tray is not None:
+            self.tray.hide()
+
+        QApplication.instance().quit()
+
     def quit_application(self):
         if self._closing:
+            return
+
+        # Сначала сохраняем данные.
+        # При ошибке оставляем приложение доступным.
+        try:
+            self.save_state()
+        except Exception as error:
+            QMessageBox.warning(
+                self,
+                "Не удалось завершить работу",
+                "Ошибка сохранения данных:\n"
+                f"{error}\n\n"
+                "Приложение пока не закрыто.",
+            )
             return
 
         self._closing = True
@@ -2233,32 +2293,61 @@ class MainWindow(QMainWindow):
         self.geometry_save_timer.stop()
         self.render_notice_timer.stop()
 
-        self.save_state()
+        # Окно исчезает сразу, а не после окончания рендера.
+        self.hide()
 
-        self.setEnabled(False)
-        self.render_status.setText(
-            "Завершение фоновой операции…"
-        )
-
+        # Пока фоновая операция завершается, значок
+        # остаётся доступным для индикации состояния.
         if self.tray is not None:
-            self.tray.hide()
+            self.tray.setToolTip(
+                "Task Wallpaper — завершение работы…"
+            )
 
-        # Выход произойдёт после сигнала stopped.
         self.render_service.stop()
+
+        # Дополнительная проверка состояния потока:
+        # не полагаемся исключительно на сигнал stopped.
+        self.shutdown_poll_timer = QTimer(self)
+        self.shutdown_poll_timer.setInterval(100)
+        self.shutdown_poll_timer.timeout.connect(
+            self.check_shutdown_complete
+        )
+        self.shutdown_poll_timer.start()
+
+        self.check_shutdown_complete()
 
     def closeEvent(self, event):
         if self._closing:
+            self.hide()
             event.ignore()
             return
 
-        self.save_state()
+        tray_available = (
+            self.tray is not None
+            and self.tray.isVisible()
+            and QSystemTrayIcon.isSystemTrayAvailable()
+        )
 
-        if self.tray is not None:
+        if tray_available:
+            try:
+                self.save_state()
+            except Exception as error:
+                QMessageBox.warning(
+                    self,
+                    "Ошибка сохранения",
+                    str(error),
+                )
+                event.ignore()
+                return
+
             self.hide()
             event.ignore()
-        else:
-            event.ignore()
-            self.quit_application()
+            return
+
+        # Если трея нет, крестик запускает
+        # полное безопасное завершение.
+        event.ignore()
+        self.quit_application()
 
 
 def main():
@@ -2270,8 +2359,16 @@ def main():
     app.setOrganizationName("TaskWallpaper")
     app.setStyle("Fusion")
 
+    # И в первом, и во втором экземпляре
+    # завершаем приложение явно.
+    app.setQuitOnLastWindowClosed(False)
+
     if ICON_FILE.is_file():
-        app.setWindowIcon(QIcon(str(ICON_FILE)))
+        app.setWindowIcon(
+            QIcon(str(ICON_FILE))
+        )
+
+    start_in_tray = "--tray" in sys.argv
 
     try:
         prepare_data()
@@ -2283,36 +2380,71 @@ def main():
         )
         return 1
 
-    instance_lock = QLockFile(
-        str(DATA / "application.lock")
-    )
-
-    if not instance_lock.tryLock(100):
-        QMessageBox.information(
-            None,
-            "Task Wallpaper",
-            "Новая версия уже запущена. "
-            "Откройте её через значок в трее.",
-        )
-        return 0
+    instance = SingleInstance(DATA, app)
 
     try:
-        window = MainWindow()
+        is_primary = instance.try_primary()
+
     except Exception as error:
         QMessageBox.critical(
             None,
             "Ошибка запуска",
-            f"{type(error).__name__}: {error}\n\n"
-            "Проверьте код и файл настроек. "
-            "Данные старой версии находятся "
-            "в отдельной папке.",
+            str(error),
         )
         return 1
 
-    # Завершаем приложение явно после остановки потока.
-    app.setQuitOnLastWindowClosed(False)
+    if not is_primary:
+        # Главное окно и рендерер во втором
+        # экземпляре вообще не создаются.
+        def secondary_finished(success, message):
+            if not success and not start_in_tray:
+                QMessageBox.warning(
+                    None,
+                    "Task Wallpaper",
+                    message,
+                )
 
-    start_in_tray = "--tray" in sys.argv
+            app.exit(0 if success else 1)
+
+        instance.secondary_finished.connect(
+            secondary_finished
+        )
+        app.aboutToQuit.connect(
+            instance.close
+        )
+
+        instance.notify_primary(
+            show_window=not start_in_tray
+        )
+
+        return app.exec()
+
+    try:
+        window = MainWindow()
+
+    except Exception as error:
+        # Если конструктор успел создать рабочий поток,
+        # подключённые обработчики aboutToQuit
+        # должны получить возможность завершить его.
+        QMessageBox.critical(
+            None,
+            "Ошибка запуска",
+            f"{type(error).__name__}: {error}\n\n"
+            "Проверьте код и файл настроек.",
+        )
+
+        QTimer.singleShot(0, app.quit)
+        app.exec()
+        instance.close()
+        return 1
+
+    instance.attach_window(window)
+
+    # Этот обработчик подключаем после создания окна:
+    # его обработчик завершения рендерера уже подключён.
+    app.aboutToQuit.connect(
+        instance.close
+    )
 
     if start_in_tray:
         window.state["auto_apply"] = True
@@ -2330,14 +2462,24 @@ def main():
 
     def initial_refresh():
         window.refresh_tasks()
-        window.regenerate()
 
         if window.state["auto_apply"]:
-            window.apply_wallpaper(silent=True)
+            window.apply_wallpaper(
+                silent=True
+            )
+        else:
+            window.regenerate()
 
-    QTimer.singleShot(0, initial_refresh)
+    QTimer.singleShot(
+        0,
+        initial_refresh,
+    )
 
     return app.exec()
+
+
+if __name__ == "__main__":
+    sys.exit(main())
 
 
 if __name__ == "__main__":
