@@ -1,5 +1,5 @@
 #define MyAppName "Task Wallpaper"
-#define MyAppVersion "2.2.0"
+#define MyAppVersion "2.2.1"
 #define MyAppExeName "TaskWallpaper.exe"
 #define MyBuildDir "dist\TaskWallpaper"
 
@@ -7,7 +7,7 @@
 AppId={{B0A541E1-C541-4A0D-A03F-E165CC3A4B30}
 AppName={#MyAppName}
 AppVersion={#MyAppVersion}
-VersionInfoVersion=2.2.0.0
+VersionInfoVersion=2.2.1.0
 OutputBaseFilename=TaskWallpaper-Setup-{#MyAppVersion}
 
 DefaultDirName={localappdata}\Programs\TaskWallpaper
